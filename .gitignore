@@ -1,0 +1,15 @@
+# Secrets — never commit
+.env
+cloud-run/.env
+
+# Dependencies
+node_modules/
+cloud-run/node_modules/
+
+# Logs / scratch
+npm-debug.log*
+tmp/
+cloud-run/tmp/
+
+# OS
+.DS_Store

@@ -1,0 +1,14 @@
+{
+  "name": "telegram-expense-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-code": "^2.1.140",
+    "googleapis": "^144.0.0"
+  }
+}
