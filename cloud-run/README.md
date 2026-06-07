@@ -62,9 +62,24 @@ explicitly shared with them.)
 Message your bot: `lunch 850 food` → it should reply with the row it added and the
 value should appear in the sheet.
 
+## Switching sheets each month
+The bot remembers an active target spreadsheet per chat (stored in Firestore), so
+you can repoint it without redeploying:
+
+- `/sheet <link or id>` — switch to a new sheet. The bot first checks it can open
+  the sheet and that the `Transactions` tab exists, then saves it. Share each new
+  month's sheet with the service account (Editor) before switching.
+- `/sheet` — show the sheet currently being written to.
+
+`SPREADSHEET_ID` in `.env` is only the *default* used until the first `/sheet`.
+
 ## Notes
-- The webhook acks Telegram immediately and processes in the background, so the
-  Claude call (a few seconds) never trips Telegram's webhook timeout.
+- The webhook handler finishes the Claude parse + sheet write **before** acking
+  Telegram. (Cloud Run throttles CPU after the response is sent, so backgrounding
+  the work would silently kill it.) A Sonnet parse is well within Telegram's ~60s
+  webhook timeout.
+- Requires the **Google Sheets API** enabled and the service account granted
+  **roles/datastore.user** (for Firestore). Both are set up already.
 - `ALLOWED_CHAT_IDS` gates who can write to your sheet. Leave it set.
 - Re-deploy after editing `server.mjs`: just run `./deploy.sh` again.
 - Logs: `gcloud run services logs read telegram-expense-bot --region us-central1`.

@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-code": "^2.1.140",
+    "@google-cloud/firestore": "^7.10.0",
     "googleapis": "^144.0.0"
   }
 }

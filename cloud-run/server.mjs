@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir } from "node:fs/promises";
 import { google } from "googleapis";
+import { Firestore } from "@google-cloud/firestore";
 
 const WORK_DIR = process.env.WORK_DIR || "/app/tmp";
 await mkdir(WORK_DIR, { recursive: true });
@@ -15,7 +16,10 @@ const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude";
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET; // validates X-Telegram-Bot-Api-Secret-Token
-const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
+// SPREADSHEET_ID is the *default* target, used until a /sheet command overrides it.
+// The active target is stored per-chat in Firestore so it survives restarts and you
+// can switch to each month's new sheet from Telegram without redeploying.
+const DEFAULT_SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const SHEET_NAME = process.env.SHEET_NAME || "Transactions";
 // Only messages from these Telegram numeric chat IDs are accepted (comma-separated).
 const ALLOWED_CHAT_IDS = (process.env.ALLOWED_CHAT_IDS || "")
@@ -26,7 +30,7 @@ const ALLOWED_CHAT_IDS = (process.env.ALLOWED_CHAT_IDS || "")
 if (!TELEGRAM_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN env var is required");
 if (!process.env.CLAUDE_CODE_OAUTH_TOKEN)
   throw new Error("CLAUDE_CODE_OAUTH_TOKEN env var is required");
-if (!SPREADSHEET_ID) throw new Error("SPREADSHEET_ID env var is required");
+if (!DEFAULT_SPREADSHEET_ID) throw new Error("SPREADSHEET_ID env var is required");
 
 // Categories from the budget sheet — keeps Claude's output aligned with the workbook.
 const CATEGORIES = [
@@ -65,6 +69,41 @@ async function getSheets() {
   return sheetsClient;
 }
 
+// ---------------------------------------------------------------------------
+// Firestore — remembers the active target spreadsheet per Telegram chat, so a
+// /sheet command sticks across container restarts. Collection: bot_targets,
+// doc id = chat id, field: spreadsheetId.
+// ---------------------------------------------------------------------------
+const db = new Firestore();
+const targetDoc = (chatId) => db.collection("bot_targets").doc(String(chatId));
+
+async function getTargetId(chatId) {
+  try {
+    const snap = await targetDoc(chatId).get();
+    if (snap.exists && snap.data().spreadsheetId) return snap.data().spreadsheetId;
+  } catch (err) {
+    console.error("firestore read failed, falling back to default:", err.message);
+  }
+  return DEFAULT_SPREADSHEET_ID;
+}
+
+async function setTargetId(chatId, spreadsheetId) {
+  await targetDoc(chatId).set(
+    { spreadsheetId, updatedAt: new Date().toISOString() },
+    { merge: true },
+  );
+}
+
+// Accept either a full Sheets URL or a bare spreadsheet ID.
+function parseSpreadsheetId(input) {
+  const s = input.trim();
+  const m = /\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/.exec(s);
+  if (m) return m[1];
+  // Bare ID: Google sheet IDs are long alphanumeric/-/_ strings.
+  if (/^[a-zA-Z0-9-_]{20,}$/.test(s)) return s;
+  return null;
+}
+
 // Expenses live in B:E, Income in G:J. Header row is row 3; data starts at row 4.
 const BLOCKS = {
   expense: { date: "B", amount: "C", description: "D", category: "E" },
@@ -75,10 +114,10 @@ const BLOCKS = {
 // block. Appending after the last entry (rather than filling the first interior
 // gap) keeps transactions in chronological order and tolerates blank spacer rows
 // that already exist in the sheet.
-async function nextEmptyRow(sheets, block) {
+async function nextEmptyRow(sheets, spreadsheetId, block) {
   const col = BLOCKS[block];
   const resp = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
+    spreadsheetId,
     range: `${SHEET_NAME}!${col.amount}4:${col.amount}10000`,
   });
   const rows = resp.data.values || [];
@@ -91,11 +130,35 @@ async function nextEmptyRow(sheets, block) {
   return 4 + last + 1; // empty block -> 4; last filled at index n -> 4+n+1
 }
 
-async function appendTransaction(tx) {
+// Confirm the bot can actually open the sheet and that the target tab exists.
+// Returns the spreadsheet title on success; throws a friendly error otherwise.
+async function validateSheet(spreadsheetId) {
+  const sheets = await getSheets();
+  let meta;
+  try {
+    meta = await sheets.spreadsheets.get({
+      spreadsheetId,
+      fields: "properties.title,sheets.properties.title",
+    });
+  } catch (err) {
+    const status = err.code || err.response?.status;
+    if (status === 403)
+      throw new Error("I can't access that sheet. Share it with the bot's service account as Editor.");
+    if (status === 404) throw new Error("No sheet found for that link/ID.");
+    throw new Error(err.message);
+  }
+  const tabs = (meta.data.sheets || []).map((s) => s.properties.title);
+  if (!tabs.includes(SHEET_NAME)) {
+    throw new Error(`That sheet has no "${SHEET_NAME}" tab. Tabs found: ${tabs.join(", ")}`);
+  }
+  return meta.data.properties.title;
+}
+
+async function appendTransaction(spreadsheetId, tx) {
   const sheets = await getSheets();
   const block = tx.type === "income" ? "income" : "expense";
   const col = BLOCKS[block];
-  const row = await nextEmptyRow(sheets, block);
+  const row = await nextEmptyRow(sheets, spreadsheetId, block);
 
   const data = [
     { range: `${SHEET_NAME}!${col.date}${row}`, values: [[tx.date]] },
@@ -105,7 +168,7 @@ async function appendTransaction(tx) {
   ];
 
   await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId: SPREADSHEET_ID,
+    spreadsheetId,
     requestBody: { valueInputOption: "USER_ENTERED", data },
   });
   return { block, row };
@@ -231,8 +294,38 @@ async function handleUpdate(update) {
       chatId,
       "Send me an expense or income in plain language, e.g.\n" +
         "`lunch 850 food`\n`got salary 250000`\n`yesterday fuel 16000`\n\n" +
-        "I'll parse it and add it to your budget sheet.",
+        "I'll parse it and add it to your budget sheet.\n\n" +
+        "*Switch sheets each month:*\n" +
+        "`/sheet <link or id>` — point me at a new sheet\n" +
+        "`/sheet` — show the current sheet",
     );
+    return;
+  }
+
+  // /sheet — show or change the active target spreadsheet for this chat.
+  if (text === "/sheet" || text.startsWith("/sheet ") || text.startsWith("/sheet@")) {
+    const arg = text.replace(/^\/sheet(@\S+)?\s*/, "");
+    if (!arg) {
+      const current = await getTargetId(chatId);
+      await sendTelegram(
+        chatId,
+        `Current sheet:\n\`${current}\`\nhttps://docs.google.com/spreadsheets/d/${current}/edit\n\n` +
+          "To switch: `/sheet <link or id>`",
+      );
+      return;
+    }
+    const id = parseSpreadsheetId(arg);
+    if (!id) {
+      await sendTelegram(chatId, "That doesn't look like a Sheets link or ID. Paste the full URL or the ID.");
+      return;
+    }
+    try {
+      const title = await validateSheet(id); // throws if inaccessible or missing tab
+      await setTargetId(chatId, id);
+      await sendTelegram(chatId, `✅ Now logging to *${title}*\n\`${id}\``);
+    } catch (err) {
+      await sendTelegram(chatId, `⚠️ ${err.message}`);
+    }
     return;
   }
 
@@ -244,7 +337,8 @@ async function handleUpdate(update) {
       return;
     }
 
-    const { block, row } = await appendTransaction(tx);
+    const spreadsheetId = await getTargetId(chatId);
+    const { block, row } = await appendTransaction(spreadsheetId, tx);
     const icon = block === "income" ? "💰" : "🧾";
     await sendTelegram(
       chatId,
