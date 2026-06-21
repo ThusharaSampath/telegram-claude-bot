@@ -2,6 +2,9 @@
 .env
 cloud-run/.env
 
+# Real financial data / PII — never commit (use a sanitized template if needed)
+*.xlsx
+
 # Dependencies
 node_modules/
 cloud-run/node_modules/
