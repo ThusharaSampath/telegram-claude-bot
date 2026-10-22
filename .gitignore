@@ -16,3 +16,6 @@ cloud-run/tmp/
 
 # OS
 .DS_Store
+
+calorie-bot/.env
+calorie-bot/node_modules/
